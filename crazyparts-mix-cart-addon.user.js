@@ -1,8 +1,8 @@
 // CP
 // ==UserScript==
-// @name         Crazyparts Mix Cart Addon v4.2 (New Site)
+// @name         Crazyparts Mix Cart Addon v4.3 (New Site)
 // @namespace    http://tampermonkey.net/
-// @version      4.2
+// @version      4.3
 // @description  Add multiple colour variants of one product to cart in one click — for the new React/Next.js crazyparts.com.au
 // @author       You
 // @match        *://www.crazyparts.com.au/*
@@ -20,6 +20,7 @@
   const CLICK_DELAY_MS = 600;   // wait after selecting a colour swatch
   const PROBE_DELAY_MS = 450;   // wait between probe clicks during stock scan
   const SCAN_INTERVAL  = 600;   // SPA re-scan interval
+  const ADD_TIMEOUT_MS = 10000; // max wait for the site's "Adding..." state to clear
 
   // ─────────────────────────────────────────────────────
   // STYLES
@@ -83,8 +84,11 @@
   // ─────────────────────────────────────────────────────
   // PAGE / ELEMENT DETECTION
   // ─────────────────────────────────────────────────────
+  // Product URLs are /product/<slug>-<id> since the 2026 redesign; the old
+  // /products/detail/<id> form is kept in case any view still links to it.
   function isProductPage() {
-    return /\/products\/detail\/\d+/.test(location.pathname);
+    return /^\/product\/[^/]+\/?$/.test(location.pathname) ||
+           /\/products\/detail\/\d+/.test(location.pathname);
   }
 
   function findAddToCartBtn() {
@@ -138,7 +142,7 @@
     const nodes = [el, el.parentElement, ...el.querySelectorAll('*')];
     for (const n of nodes) {
       if (!n || !n.getAttribute) continue;
-      if (/\b(active|selected|checked|current|on)\b/i.test(String(n.className || ''))) return true;
+      if (/\b(active|selected|checked|current|on|border-red-500)\b/i.test(String(n.className || ''))) return true;
       if (n.getAttribute('aria-checked') === 'true' || n.getAttribute('aria-selected') === 'true') return true;
     }
     return false;
@@ -212,7 +216,9 @@
     return Array.from(document.querySelectorAll('span,div,label,p,b,strong,dt,h3,h4'))
       .find(el => {
         if (!visible(el) || el.closest('#mca-wrap')) return false;
-        const own = (el.childNodes[0]?.nodeType === 3 ? el.childNodes[0].textContent : el.textContent) || '';
+        // Only the element's own text: a wrapper row whose children happen to
+        // read "Color" (no colour picked yet) must not match ahead of the label.
+        const own = Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent).join('');
         return /^colou?r[:：]?$/i.test(own.trim());
       }) || null;
   }
@@ -257,9 +263,36 @@
     return best.length >= 2 ? best : null;
   }
 
+  // New site: the "Color" heading's row is followed by a flex-wrap row of
+  // tooltip spans, each wrapping a 32px round swatch div that owns the
+  // onClick. Out-of-stock swatches get opacity-70 plus a rotate-45 slash;
+  // impossible combinations get cursor-not-allowed.
+  function detectNewSiteSwatches(lab) {
+    const headRow = lab.parentElement;
+    const list = headRow && headRow.nextElementSibling;
+    if (!list) return null;
+    const els = Array.from(list.querySelectorAll('div.rounded-full'))
+      .filter(el => el.parentElement && !el.parentElement.closest('div.rounded-full') &&
+                    /h-\[32px\]/.test(String(el.className)));
+    if (els.length < 2) return null;
+    return els.map((el, i) => {
+      const inner = el.querySelector('div');
+      const rgb = parseRGB(inner && inner.style.backgroundColor) || swatchBgRGB(el);
+      const cls = String(el.className);
+      return {
+        name: nearestColourName(rgb) || ('Colour ' + (i + 1)),
+        ofs:  /\bopacity-70\b|cursor-not-allowed/.test(cls) || !!el.querySelector('.rotate-45'),
+        rgb,
+        el
+      };
+    });
+  }
+
   function detectColourOptions() {
     // 1) anchored on the "Color" label
     const lab = findColourLabelEl();
+    const fresh = lab && detectNewSiteSwatches(lab);
+    if (fresh) return fresh;
     if (lab) {
       let container = lab.parentElement;
       for (let hop = 0; hop < 4 && container; hop++, container = container.parentElement) {
@@ -311,9 +344,22 @@
       opt.el.dispatchEvent(new Event('change', { bubbles: true }));
     } else {
       opt.el.scrollIntoView({ block: 'center' });
-      opt.el.click();
+      // The site toggles: clicking the selected colour deselects it and the
+      // Add To Cart button disappears.
+      if (!isSelectedSwatch(opt.el)) opt.el.click();
     }
     await sleep(CLICK_DELAY_MS);
+  }
+
+  // After a click the button reads "Adding..." then "Added!" for a second;
+  // wait for it to settle back to "Add To Cart" before the next item.
+  async function waitForAddIdle() {
+    const t0 = Date.now();
+    while (Date.now() - t0 < ADD_TIMEOUT_MS) {
+      await sleep(250);
+      if (findAddToCartBtn()) return true;
+    }
+    return false;
   }
 
   async function addOne(opt, qty) {
@@ -328,13 +374,22 @@
       if (qtyInp) {
         setReactInputValue(qtyInp, qty);
         await sleep(250);
-        addBtn.click();
+        // the site clamps the box to available stock
+        const got = parseInt(qtyInp.value) || 0;
+        if (got !== qty) return { ok: false, live, why: `only ${got} available` };
+        const btn = findAddToCartBtn();
+        if (!btn || btn.disabled) return { ok: false, live, why: 'Add button disabled after setting qty' };
+        btn.click();
         await sleep(ADD_DELAY_MS);
+        if (!(await waitForAddIdle())) return { ok: false, live, why: 'site did not confirm the add' };
         return { ok: true, live };
       }
       for (let i = 0; i < qty; i++) {
-        addBtn.click();
+        const btn = findAddToCartBtn();
+        if (!btn) return { ok: false, live, why: `stopped after ${i} — button gone` };
+        btn.click();
         await sleep(ADD_DELAY_MS);
+        await waitForAddIdle();
       }
       return { ok: true, live };
     } catch (e) {
@@ -358,8 +413,10 @@
       onProgress && onProgress(i, colours.length, c.name);
       const before = currentSelectedColourName();
       const wasSelected = isSelectedSwatch(c.el);
-      c.el.click();
-      await sleep(PROBE_DELAY_MS);
+      if (!wasSelected) {
+        c.el.click();
+        await sleep(PROBE_DELAY_MS);
+      }
       const after  = currentSelectedColourName();
       const addBtn = findAddToCartBtn();
       const btnDead = !addBtn || addBtn.disabled ||
@@ -380,18 +437,32 @@
     // restore original selection
     const back = colours.find(c => !c.ofs && c.name === originalName) ||
                  colours.find(c => !c.ofs);
-    if (back) { back.el.click(); await sleep(PROBE_DELAY_MS); }
+    if (back && !isSelectedSwatch(back.el)) { back.el.click(); await sleep(PROBE_DELAY_MS); }
   }
 
   // ─────────────────────────────────────────────────────
   // WIDGET BUILD
   // ─────────────────────────────────────────────────────
-  function buildWidget() {
+  // Where the panel goes: below the colour picker block on the new site
+  // (the Add To Cart row is swapped out by React as stock changes), else
+  // below the Add To Cart button's container.
+  function findWidgetAnchor(colours) {
+    const sw = colours.find(c => c.el.tagName !== 'SELECT');
+    const lab = findColourLabelEl();
+    if (sw && lab) {
+      const block = lab.closest('div.flex.flex-col.gap-4');
+      if (block && block.contains(sw.el)) return block;
+    }
     const addBtn = findAddToCartBtn();
-    if (!addBtn) return false;
+    return addBtn ? (addBtn.closest('div') || addBtn) : null;
+  }
+
+  function buildWidget() {
     if (document.getElementById('mca-wrap')) return true;
 
     const colours = detectColourOptions();
+    const host = findWidgetAnchor(colours);
+    if (!host) return false;
 
     const wrap = document.createElement('div');
     wrap.id = 'mca-wrap';
@@ -420,7 +491,6 @@
         </div>
       </div>`;
 
-    const host = addBtn.closest('div') || addBtn;
     host.insertAdjacentElement('afterend', wrap);
 
     const body      = wrap.querySelector('#mca-body');
