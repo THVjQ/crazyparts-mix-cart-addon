@@ -1,8 +1,8 @@
 // CP
 // ==UserScript==
-// @name         Crazyparts Mix Cart Addon v4.3 (New Site)
+// @name         Crazyparts Mix Cart Addon v4.4 (New Site)
 // @namespace    http://tampermonkey.net/
-// @version      4.3
+// @version      4.4
 // @description  Add multiple colour variants of one product to cart in one click — for the new React/Next.js crazyparts.com.au
 // @author       You
 // @match        *://www.crazyparts.com.au/*
@@ -19,6 +19,7 @@
   const ADD_DELAY_MS   = 1500;  // wait after each add-to-cart click
   const CLICK_DELAY_MS = 600;   // wait after selecting a colour swatch
   const PROBE_DELAY_MS = 450;   // wait between probe clicks during stock scan
+  const PROBE_SETTLE_MS = 3000; // max wait for the page to show a colour's stock state
   const SCAN_INTERVAL  = 600;   // SPA re-scan interval
   const ADD_TIMEOUT_MS = 10000; // max wait for the site's "Adding..." state to clear
 
@@ -366,7 +367,10 @@
     try {
       await selectColour(opt);
       const addBtn = findAddToCartBtn();
-      if (!addBtn) return { ok: false, why: 'Add To Cart button not found' };
+      if (!addBtn) {
+        const st = readStockState();
+        return { ok: false, why: st && st !== 'instock' ? STOCK_BADGE[st] : 'Add To Cart button not found' };
+      }
       if (addBtn.disabled || looksOFS(addBtn)) return { ok: false, why: 'Add button disabled (out of stock?)' };
 
       const live = currentSelectedColourName();
@@ -397,6 +401,23 @@
     }
   }
 
+  // What the page offers for the selected colour. The site only slashes a
+  // swatch when it is out everywhere; stock held at another warehouse or
+  // pre-order-only still looks available on the swatch but has no Add To Cart.
+  const STOCK_BADGE = { oos: 'OFS', other: 'Other store', preorder: 'Pre-order only', unknown: 'No add button' };
+
+  function readStockState() {
+    const addBtn = findAddToCartBtn();
+    if (addBtn && !addBtn.disabled) return 'instock';
+    const texts = Array.from(document.querySelectorAll('button'))
+      .filter(b => visible(b) && !b.closest('#mca-wrap'))
+      .map(b => (b.textContent || '').trim());
+    if (texts.some(t => /^pre-?order$/i.test(t)))                return 'preorder';
+    if (texts.some(t => /available at other location/i.test(t))) return 'other';
+    if (texts.some(t => /in stock notice/i.test(t)))              return 'oos';
+    return null;
+  }
+
   // ─────────────────────────────────────────────────────
   // ACTIVE STOCK PROBE — authoritative OFS check.
   // Clicks each swatch, watches whether the "Color: X" label
@@ -417,21 +438,23 @@
         c.el.click();
         await sleep(PROBE_DELAY_MS);
       }
+      // give React time to swap in the stock row for this colour
+      let state = readStockState();
+      for (let t = 0; !state && t < PROBE_SETTLE_MS; t += 150) {
+        await sleep(150);
+        state = readStockState();
+      }
       const after  = currentSelectedColourName();
-      const addBtn = findAddToCartBtn();
-      const btnDead = !addBtn || addBtn.disabled ||
-        addBtn.getAttribute('aria-disabled') === 'true' ||
-        /\b(disabled)\b/i.test(String(addBtn.className || ''));
-
       const changed = !!after && after !== before;
       const nowSelected = isSelectedSwatch(c.el);
 
       if (changed) c.name = after;            // real site name
       else if (after && (wasSelected || nowSelected)) c.name = after;
 
-      // OFS if the button died, or the click did nothing
-      // (label unchanged AND swatch never shows as selected)
-      c.ofs = btnDead || (!changed && !wasSelected && !nowSelected);
+      // the click did nothing (label unchanged AND swatch never selected)
+      const dead = !changed && !wasSelected && !nowSelected;
+      c.stock = dead ? 'oos' : (state || 'unknown');
+      c.ofs = c.stock !== 'instock';
     }
 
     // restore original selection
@@ -548,7 +571,8 @@
         if (c.ofs) {
           const badge = document.createElement('span');
           badge.className = 'mca-ofs-badge';
-          badge.textContent = 'OFS';
+          badge.textContent = STOCK_BADGE[c.stock] || 'OFS';
+          if (c.stock === 'other') badge.title = 'Stock is at another warehouse — use the site\'s "Available at other location" button for this colour';
           row.appendChild(badge);
         }
 
